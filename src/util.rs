@@ -1,6 +1,7 @@
-use std::{
+use core::{
     mem::ManuallyDrop,
     ops::{Deref, DerefMut},
+    time::Duration,
 };
 
 /// `WithCleanup` can wrap any value
@@ -48,5 +49,35 @@ impl<T, F: FnOnce(T)> Deref for WithCleanup<T, F> {
 impl<T, F: FnOnce(T)> DerefMut for WithCleanup<T, F> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.inner
+    }
+}
+
+pub struct Waiter {
+    pub(crate) timer: esp_idf_svc::timer::EspTaskTimerService,
+}
+impl Waiter {
+    pub fn new() -> Self {
+        Self {
+            timer: esp_idf_svc::timer::EspTimerService::new().expect("Failed to initialize timer!"),
+        }
+    }
+    pub fn now(&self) -> Duration {
+        self.timer.now()
+    }
+    pub fn wait_for(
+        &self,
+        condition: impl Fn() -> bool,
+        timeout: Duration,
+    ) -> Result<Duration, Duration> {
+        let start = self.timer.now();
+        loop {
+            let now = self.timer.now();
+            if condition() {
+                return Ok(now);
+            }
+            if now - start > timeout {
+                return Err(now);
+            }
+        }
     }
 }

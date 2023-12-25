@@ -3,10 +3,9 @@ use esp_idf_hal::{
     gpio::{InputOutput, PinDriver},
     peripheral::Peripheral,
     peripherals::Peripherals,
+    sys::EspError,
     timer::{config::Config, Timer, TimerDriver},
 };
-use esp_idf_sys::EspError;
-use fugit::TimerInstantU32;
 
 struct Pin<'pin, P: esp_idf_hal::gpio::Pin>(esp_idf_hal::gpio::PinDriver<'pin, P, InputOutput>);
 
@@ -41,12 +40,12 @@ impl<'timer> MicroTimer<'timer> {
         Ok(Self(TimerDriver::new(timer, &Config::new())?))
     }
 }
-type TimerInstant1MHzU32 = TimerInstantU32<1_000_000u32>;
+
 // The timer uses the APB_CLK which typically ticks with 80 MHz https://docs.espressif.com/projects/esp-idf/en/latest/esp32c3/api-reference/system/system_time.html
 // and per default uses a divider of 80. Therefor the timer tick frequency is 1MHz.
-impl<'timer> dht22::MicroTimer<1_000_000u32> for MicroTimer<'timer> {
-    fn now(&self) -> TimerInstant1MHzU32 {
-        TimerInstant1MHzU32::from_ticks(
+impl<'timer> dht22::MicroTimer for MicroTimer<'timer> {
+    fn now(&self) -> dht22::Microseconds {
+        dht22::Microseconds(
             TryFrom::try_from(self.0.counter().expect("Could not read timer counter!"))
                 .expect("Overflow while converting timer ticks from u64 to u32 "),
         )
@@ -62,20 +61,17 @@ fn main() -> Result<(), EspError> {
     std::thread::sleep(std::time::Duration::from_millis(100));
     let clock = MicroTimer::new(peripherals.timer00)?;
     let mut sensor = dht22::Dht22::new(pin, clock);
-    let number_tries = 20;
-    for _ in 0..number_tries {
+    loop {
         match sensor.read() {
             Ok(result) => {
                 println!(
                     "Humidity: {}, Temperature: {}",
                     result.humidity, result.temperature
                 );
-                break;
             }
             Err(err) => println!("{err}"),
         }
         std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    println!("Exit main");
     Ok(())
 }

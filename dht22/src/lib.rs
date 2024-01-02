@@ -28,8 +28,6 @@
 /// // Newtype over device specific clock/timer
 /// struct MicroTimer;
 ///
-/// // The timer uses the APB_CLK which typically ticks with 80 MHz https://docs.espressif.com/projects/esp-idf/en/latest/esp32c3/api-reference/system/system_time.html
-/// // and per default uses a divider of 80. Therefor the timer tick frequency is 1MHz.
 /// impl dht22::MicroTimer for MicroTimer {
 ///     fn now(&self) -> dht22::Microseconds {
 ///         dht22::Microseconds(
@@ -38,34 +36,59 @@
 ///     }
 /// }
 /// fn main() -> Result<(), SomeMCUSpecificError> {
-/// let mut pin = Pin;
-/// pin.set_high()?;
-/// let clock = MicroTimer;
-/// let mut sensor = dht22::Dht22::new(pin, clock);
-/// loop {
-///     std::thread::sleep(std::time::Duration::from_secs(2));
-///     if let Ok(reading) = sensor.read() {
-///         println!("Humidity: {:?}, Temperature: {:?}", reading.humidity, reading.temperature);    
+///     let mut pin = Pin;
+///     pin.set_high()?;
+///     let timer = MicroTimer;
+///     let mut sensor = dht22::Dht22::new(pin, timer);
+///     loop {
+///         std::thread::sleep(std::time::Duration::from_secs(2));
+///         if let Ok(reading) = sensor.read() {
+///             println!("Humidity: {:?}, Temperature: {:?}", reading.humidity, reading.temperature);    
+///         }
 ///     }
-/// }
-/// Ok(())
 /// }
 /// ```
 
-#[cfg(feature = "std")]
-use thiserror::Error;
-
 #[derive(Debug)]
-#[cfg_attr(feature = "std", derive(Error))]
 pub enum DhtError<DeviceError> {
-    #[cfg_attr(feature = "std", error("Handshake failed"))]
-    Handshake(u8),
-    #[cfg_attr(feature = "std", error("Timeout in data transmission after {}us", 0.0))]
-    DataTransmissionTimeout(Microseconds),
-    #[cfg_attr(feature = "std", error("Checksum validation failed"))]
-    Checksum,
-    #[cfg_attr(feature = "std", error("DeviceError: {0}"))]
-    DeviceError(#[cfg_attr(feature = "std", from)] DeviceError),
+    /// Initial handshake with the sensor was unsuccessful. Make sure all physical connections are working, individual reads of the sensor are seperated by at least 2 seconds and the pin state is high while idle
+    Handshake,
+    /// Timeout while waiting for the sensor to respond
+    Timeout(Microseconds),
+    /// The checksum of the read data does not match with the provided checksum
+    Checksum { correct: u8, actual: u8 },
+    /// While setting the pin state the DeviceError occured
+    DeviceError(DeviceError),
+}
+
+impl<DeviceError> core::fmt::Display for DhtError<DeviceError>
+where
+    DeviceError: core::fmt::Display,
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            DhtError::Handshake => write!(f, "Inital handshake failed!"),
+            DhtError::Timeout(us) => write!(
+                f,
+                "Timeout while waiting for level change after {} microseconds",
+                us.0
+            ),
+            DhtError::Checksum { correct, actual } => write!(
+                f,
+                "Checksum validation failed. Correct: {correct}, Actual: {actual}"
+            ),
+            DhtError::DeviceError(device_error) => write!(f, "DeviceError: {device_error}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<DeviceError> std::error::Error for DhtError<DeviceError> where DeviceError: std::error::Error {}
+
+impl<DeviceError> From<DeviceError> for DhtError<DeviceError> {
+    fn from(value: DeviceError) -> Self {
+        Self::DeviceError(value)
+    }
 }
 
 /// Represents a GPIO pin capable of reading and setting the voltage level
@@ -90,13 +113,13 @@ pub trait MicroTimer {
 }
 
 /// Represents a DHT22 sensor connected to a pin.
-pub struct Dht22<Pin, ClockT>
+pub struct Dht22<Pin, Timer>
 where
     Pin: IOPin,
-    ClockT: MicroTimer,
+    Timer: MicroTimer,
 {
     pin: Pin,
-    clock: ClockT,
+    timer: Timer,
 }
 
 /// A valid reading from the DHT22 sensor
@@ -114,36 +137,36 @@ where
     /// Construct a new representation of the DHT22 sensor.
     /// Construction is cheap as long as the pin and clock are cheap to move.
     pub fn new(pin: Pin, clock: ClockT) -> Self {
-        Self { pin, clock }
+        Self { pin, timer: clock }
     }
     /// Attempt one read from the DHT22 sensor.
     /// Between subsequent reads from the same sensor at least 2 seconds should pass to avoid erratic readings.
     /// Reading to early after startup may also result in failure to read.
     pub fn read(&mut self) -> Result<SensorReading, DhtError<Pin::DeviceError>> {
         const RESPONSE_BITS: usize = 40;
-        let mut pin = scopeguard::guard(&mut self.pin, |pin| {
-            pin.set_high()
-                .expect("Failed to reset pin to high at scope exit of Dht22::read!");
-        });
         // Each bit is indicated by the two edges of the HIGH level (up, down).
         // In addition the initial down edge from the get-ready HIGH state is recorded.
         let mut cycles: [u32; 2 * RESPONSE_BITS + 1] = [0; 2 * RESPONSE_BITS + 1];
-        let waiter = Waiter { clock: &self.clock };
+        let waiter = Waiter { clock: &self.timer };
         // Disable interrupts while interacting with the sensor so they don't mess up the timings
         critical_section::with(|_guard| {
+            let mut pin = scopeguard::guard(&mut self.pin, |pin| {
+                // Failing to reset the pin is no hard error and error reporting from the drop impl of the scopeguard is not possible.
+                let _ = pin.set_high();
+            });
             // Initial handshake
-            pin.set_low().map_err(DhtError::DeviceError)?;
+            pin.set_low()?;
             let _ = waiter.wait_for(|| false, 1200);
-            pin.set_high().map_err(DhtError::DeviceError)?;
+            pin.set_high()?;
 
             // Wait for DHT22 to acknowledge the handshake with low
             if waiter.wait_for(|| pin.is_low(), 100).is_err() {
-                return Err(DhtError::Handshake(0));
+                return Err(DhtError::Handshake);
             }
 
             // Wait for low to end
             if waiter.wait_for(|| pin.is_high(), 100).is_err() {
-                return Err(DhtError::Handshake(1));
+                return Err(DhtError::Handshake);
             }
             // Data transfer started. Each bit starts with 50us low and than ~27us high for a 0 or ~70us high for a 1.
             // The pin should stay high for about 80us before transmission starts, we don't actually care about the precise timing of this duration.
@@ -153,7 +176,7 @@ where
                 *duration = waiter
                     .wait_for(|| is_high != pin.is_high(), 100)
                     .map(|microsecond| microsecond.0)
-                    .map_err(DhtError::DataTransmissionTimeout)?;
+                    .map_err(DhtError::Timeout)?;
 
                 is_high = !is_high;
             }
@@ -183,13 +206,13 @@ where
             bytes[byte_idx] |= 1 << (7 - bit_idx);
         }
         // Verify the checksum in the last byte
-        if bytes[0]
+        let correct = bytes[4];
+        let actual = bytes[0]
             .wrapping_add(bytes[1])
             .wrapping_add(bytes[2])
-            .wrapping_add(bytes[3])
-            != bytes[4]
-        {
-            return Err(DhtError::Checksum);
+            .wrapping_add(bytes[3]);
+        if actual != correct {
+            return Err(DhtError::Checksum { actual, correct });
         }
         let humidity = (((bytes[0] as u32) << 8 | bytes[1] as u32) as f32) / 10.;
         // The MSB of the 16 temperature bits indicates negative temperatures

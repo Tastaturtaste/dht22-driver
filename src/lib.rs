@@ -1,53 +1,12 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-/// Example usage:
-/// ```no_run
-/// use dht22::IOPin;
-/// // Newtype over device specific GPIO pin type
-/// struct Pin;
-/// #[derive(Debug)]
-/// struct SomeMCUSpecificError;
-/// impl IOPin for Pin
-/// {
-///     type DeviceError = SomeMCUSpecificError;
-///     fn set_low(&mut self) -> Result<(), Self::DeviceError> {
-///         todo!()
-///     }
-///
-///     fn set_high(&mut self) -> Result<(), Self::DeviceError> {
-///         todo!()
-///     }
-///
-///     fn is_low(&self) -> bool {
-///         todo!()
-///     }
-///
-///     fn is_high(&self) -> bool {
-///         todo!()
-///     }
-/// }
-/// // Newtype over device specific clock/timer
-/// struct MicroTimer;
-///
-/// impl dht22::MicroTimer for MicroTimer {
-///     fn now(&self) -> dht22::Microseconds {
-///         dht22::Microseconds(
-///             todo!()
-///         )
-///     }
-/// }
-/// fn main() -> Result<(), SomeMCUSpecificError> {
-///     let mut pin = Pin;
-///     pin.set_high()?;
-///     let timer = MicroTimer;
-///     let mut sensor = dht22::Dht22::new(pin, timer);
-///     loop {
-///         std::thread::sleep(std::time::Duration::from_secs(2));
-///         if let Ok(reading) = sensor.read() {
-///             println!("Humidity: {:?}, Temperature: {:?}", reading.humidity, reading.temperature);    
-///         }
-///     }
-/// }
-/// ```
+#![doc = include_str!(concat!(env!("CARGO_MANIFEST_DIR"),"/README.md"))]
+
+#[cfg(feature = "critical-section")]
+use critical_section::with;
+#[cfg(not(feature = "critical-section"))]
+fn with<R>(f: impl FnOnce(()) -> R) -> R {
+    f(())
+}
 
 #[derive(Debug)]
 pub enum DhtError<DeviceError> {
@@ -100,8 +59,10 @@ pub trait IOPin {
     fn is_high(&self) -> bool;
 }
 
+/// Represents a number of microseconds.
 /// Simple Newtype to attach meaning to the contained primitive.
-/// Represents a number of microseconds
+/// The std::duration::Duration which could also be used here is a much larger type in order to accomodate much
+/// bigger time spans, which may impact performance, code size and stack usage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Microseconds(pub u32);
 
@@ -128,15 +89,15 @@ pub struct SensorReading {
     pub temperature: f32,
 }
 
-impl<Pin, ClockT> Dht22<Pin, ClockT>
+impl<Pin, Timer> Dht22<Pin, Timer>
 where
     Pin: IOPin,
     <Pin as IOPin>::DeviceError: core::fmt::Debug,
-    ClockT: MicroTimer,
+    Timer: MicroTimer,
 {
     /// Construct a new representation of the DHT22 sensor.
     /// Construction is cheap as long as the pin and clock are cheap to move.
-    pub fn new(pin: Pin, clock: ClockT) -> Self {
+    pub fn new(pin: Pin, clock: Timer) -> Self {
         Self { pin, timer: clock }
     }
     /// Attempt one read from the DHT22 sensor.
@@ -147,25 +108,21 @@ where
         // Each bit is indicated by the two edges of the HIGH level (up, down).
         // In addition the initial down edge from the get-ready HIGH state is recorded.
         let mut cycles: [u32; 2 * RESPONSE_BITS + 1] = [0; 2 * RESPONSE_BITS + 1];
-        let waiter = Waiter { clock: &self.timer };
+        let waiter = Waiter { timer: &self.timer };
         // Disable interrupts while interacting with the sensor so they don't mess up the timings
-        critical_section::with(|_guard| {
-            let mut pin = scopeguard::guard(&mut self.pin, |pin| {
-                // Failing to reset the pin is no hard error and error reporting from the drop impl of the scopeguard is not possible.
-                let _ = pin.set_high();
-            });
+        with(|_guard| {
             // Initial handshake
-            pin.set_low()?;
+            self.pin.set_low()?;
             let _ = waiter.wait_for(|| false, 1200);
-            pin.set_high()?;
+            self.pin.set_high()?;
 
             // Wait for DHT22 to acknowledge the handshake with low
-            if waiter.wait_for(|| pin.is_low(), 100).is_err() {
+            if waiter.wait_for(|| self.pin.is_low(), 100).is_err() {
                 return Err(DhtError::Handshake);
             }
 
             // Wait for low to end
-            if waiter.wait_for(|| pin.is_high(), 100).is_err() {
+            if waiter.wait_for(|| self.pin.is_high(), 100).is_err() {
                 return Err(DhtError::Handshake);
             }
             // Data transfer started. Each bit starts with 50us low and than ~27us high for a 0 or ~70us high for a 1.
@@ -174,7 +131,7 @@ where
             let mut is_high = true;
             for duration in &mut cycles {
                 *duration = waiter
-                    .wait_for(|| is_high != pin.is_high(), 100)
+                    .wait_for(|| is_high != self.pin.is_high(), 100)
                     .map(|microsecond| microsecond.0)
                     .map_err(DhtError::Timeout)?;
 
@@ -182,6 +139,12 @@ where
             }
             // Data transfer ended
             Ok(())
+        })
+        .map_err(|err| {
+            // Reset pin to high, which is the idle state of the dht22
+            // Ignore any error that might occur here so the user sees the first error that occured
+            let _ = self.pin.set_high();
+            err
         })?;
 
         let mut bytes: [u8; 5] = [0; 5];
@@ -231,15 +194,15 @@ where
     }
 }
 
-struct Waiter<'clock, ClockT>
+struct Waiter<'timer, Timer>
 where
-    ClockT: MicroTimer,
+    Timer: MicroTimer,
 {
-    clock: &'clock ClockT,
+    timer: &'timer Timer,
 }
-impl<'clock, ClockT> Waiter<'clock, ClockT>
+impl<'timer, Timer> Waiter<'timer, Timer>
 where
-    ClockT: MicroTimer,
+    Timer: MicroTimer,
 {
     #[inline(always)]
     fn wait_for(
@@ -247,13 +210,13 @@ where
         condition: impl Fn() -> bool,
         timeout: u32,
     ) -> Result<Microseconds, Microseconds> {
-        let start = self.clock.now();
+        let start = self.timer.now();
         loop {
             // Using wrapping arithmetic on unsigned integers, overflow of the timer can be
             // exploited to count over the whole representable range of the integer type regardless of initial value.
             // For example for a u8:
             // 10 - 230 = 36
-            let since_start = self.clock.now().0.wrapping_sub(start.0);
+            let since_start = self.timer.now().0.wrapping_sub(start.0);
             if condition() {
                 return Ok(Microseconds(since_start));
             }

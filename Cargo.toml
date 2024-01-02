@@ -1,0 +1,20 @@
+[package]
+name = "dht22-driver"
+description = "No-std, no-dependency, platform-agnostic driver for the dht22 sensor"
+authors = ["Tastaturtaste <joshua.moellers@gmx.net>"]
+edition = "2021"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+categories = ["embedded", "hardware-support"]
+keywords = ["dht22", "driver", "temperature", "humidity", "no-std"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[features]
+default = ["critical-section"]
+std = []
+critical-section = ["dep:critical-section"]
+
+[dependencies]
+critical-section = { version = "1.1.2", optional = true }

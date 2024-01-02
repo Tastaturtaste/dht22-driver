@@ -1,4 +1,4 @@
-use dht22::IOPin;
+use dht22_driver::{Dht22, IOPin, MicroTimer, Microseconds};
 use esp_idf_hal::{
     gpio::{InputOutput, PinDriver},
     peripheral::Peripheral,
@@ -33,9 +33,9 @@ where
     }
 }
 
-struct MicroTimer<'timer>(TimerDriver<'timer>);
+struct DeviceTimer<'timer>(TimerDriver<'timer>);
 
-impl<'timer> MicroTimer<'timer> {
+impl<'timer> DeviceTimer<'timer> {
     fn new(timer: impl Peripheral<P = impl Timer> + 'timer) -> Result<Self, EspError> {
         Ok(Self(TimerDriver::new(timer, &Config::new())?))
     }
@@ -43,9 +43,9 @@ impl<'timer> MicroTimer<'timer> {
 
 // The timer uses the APB_CLK which typically ticks with 80 MHz https://docs.espressif.com/projects/esp-idf/en/latest/esp32c3/api-reference/system/system_time.html
 // and per default uses a divider of 80. Therefor the timer tick frequency is 1MHz.
-impl<'timer> dht22::MicroTimer for MicroTimer<'timer> {
-    fn now(&self) -> dht22::Microseconds {
-        dht22::Microseconds(
+impl<'timer> MicroTimer for DeviceTimer<'timer> {
+    fn now(&self) -> Microseconds {
+        Microseconds(
             TryFrom::try_from(self.0.counter().expect("Could not read timer counter!"))
                 .expect("Overflow while converting timer ticks from u64 to u32 "),
         )
@@ -59,8 +59,8 @@ fn main() -> Result<(), EspError> {
     let mut pin = Pin(PinDriver::input_output_od(peripherals.pins.gpio2)?);
     pin.set_high()?;
     std::thread::sleep(std::time::Duration::from_millis(100));
-    let clock = MicroTimer::new(peripherals.timer00)?;
-    let mut sensor = dht22::Dht22::new(pin, clock);
+    let clock = DeviceTimer::new(peripherals.timer00)?;
+    let mut sensor = Dht22::new(pin, clock);
     loop {
         match sensor.read() {
             Ok(result) => {
